@@ -1,146 +1,199 @@
-terraform {
-  required_version = ">= 0.12"
+resource "aws_instance" "web_host" {
+  # ec2 have plain text secrets in user data
+  ami           = "${var.ami}"
+  instance_type = "t2.nano"
+
+  vpc_security_group_ids = [
+  "${aws_security_group.web-node.id}"]
+  subnet_id = "${aws_subnet.web_subnet.id}"
+  user_data = <<EOF
+#! /bin/bash
+sudo apt-get update
+sudo apt-get install -y apache2
+sudo systemctl start apache2
+sudo systemctl enable apache2
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMAAA
+export AWS_SECRET_ACCESS_KEY=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
+export AWS_DEFAULT_REGION=us-west-2
+echo "<h1>Deployed via Terraform</h1>" | sudo tee /var/www/html/index.html
+EOF
+  tags = {
+    Name = "${local.resource_prefix.value}-ec2"
+  }
 }
 
-provider "aws" {
-  region = var.aws_region
+resource "aws_ebs_volume" "web_host_storage" {
+  # unencrypted volume
+  availability_zone = "${var.availability_zone}"
+  #encrypted         = false  # Setting this causes the volume to be recreated on apply 
+  size = 1
+  tags = {
+    Name = "${local.resource_prefix.value}-ebs"
+  }
 }
 
-# Create a VPC to launch our instances into
-resource "aws_vpc" "default" {
-  cidr_block = "10.0.0.0/16"
+resource "aws_ebs_snapshot" "example_snapshot" {
+  # ebs snapshot without encryption
+  volume_id   = "${aws_ebs_volume.web_host_storage.id}"
+  description = "${local.resource_prefix.value}-ebs-snapshot"
+  tags = {
+    Name = "${local.resource_prefix.value}-ebs-snapshot"
+  }
 }
 
-# Create an internet gateway to give our subnet access to the outside world
-resource "aws_internet_gateway" "default" {
-  vpc_id = aws_vpc.default.id
+resource "aws_volume_attachment" "ebs_att" {
+  device_name = "/dev/sdh"
+  volume_id   = "${aws_ebs_volume.web_host_storage.id}"
+  instance_id = "${aws_instance.web_host.id}"
 }
 
-# Grant the VPC internet access on its main route table
-resource "aws_route" "internet_access" {
-  route_table_id         = aws_vpc.default.main_route_table_id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.default.id
+resource "aws_security_group" "web-node" {
+  # security group is open to the world in SSH port
+  name        = "${local.resource_prefix.value}-sg"
+  description = "${local.resource_prefix.value} Security Group"
+  vpc_id      = aws_vpc.web_vpc.id
+
+  ingress {
+    from_port = 80
+    to_port   = 80
+    protocol  = "tcp"
+    cidr_blocks = [
+    "0.0.0.0/0"]
+  }
+  ingress {
+    from_port = 22
+    to_port   = 22
+    protocol  = "tcp"
+    cidr_blocks = [
+    "0.0.0.0/0"]
+  }
+  egress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    cidr_blocks = [
+    "0.0.0.0/0"]
+  }
+  depends_on = [aws_vpc.web_vpc]
 }
 
-# Create a subnet to launch our instances into
-resource "aws_subnet" "default" {
-  vpc_id                  = aws_vpc.default.id
-  cidr_block              = "10.0.1.0/24"
+resource "aws_vpc" "web_vpc" {
+  cidr_block           = "172.16.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags = {
+    Name = "${local.resource_prefix.value}-vpc"
+  }
+}
+
+resource "aws_subnet" "web_subnet" {
+  vpc_id                  = aws_vpc.web_vpc.id
+  cidr_block              = "172.16.10.0/24"
+  availability_zone       = var.availability_zone
   map_public_ip_on_launch = true
-}
 
-# A security group for the ELB so it is accessible via the web
-resource "aws_security_group" "elb" {
-  name        = "terraform_example_elb"
-  description = "Used in the terraform"
-  vpc_id      = aws_vpc.default.id
-
-  # HTTP access from anywhere
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # outbound internet access
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  tags = {
+    Name = "${local.resource_prefix.value}-subnet"
   }
 }
 
-# Our default security group to access
-# the instances over SSH and HTTP
-resource "aws_security_group" "default" {
-  name        = "terraform_example"
-  description = "Used in the terraform"
-  vpc_id      = aws_vpc.default.id
+resource "aws_subnet" "web_subnet2" {
+  vpc_id                  = aws_vpc.web_vpc.id
+  cidr_block              = "172.16.11.0/24"
+  availability_zone       = var.availability_zone2
+  map_public_ip_on_launch = true
 
-  # SSH access from anywhere
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # HTTP access from the VPC
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-  }
-
-  # outbound internet access
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  tags = {
+    Name = "${local.resource_prefix.value}-subnet2"
   }
 }
 
-resource "aws_elb" "web" {
-  name = "terraform-example-elb"
 
-  subnets         = [aws_subnet.default.id]
-  security_groups = [aws_security_group.elb.id]
-  instances       = [aws_instance.web.id]
+resource "aws_internet_gateway" "web_igw" {
+  vpc_id = aws_vpc.web_vpc.id
 
-  listener {
-    instance_port     = 80
-    instance_protocol = "http"
-    lb_port           = 80
-    lb_protocol       = "http"
+  tags = {
+    Name = "${local.resource_prefix.value}-igw"
   }
 }
 
-resource "aws_key_pair" "auth" {
-  key_name   = var.key_name
-  public_key = file(var.public_key_path)
+resource "aws_route_table" "web_rtb" {
+  vpc_id = aws_vpc.web_vpc.id
+
+  tags = {
+    Name = "${local.resource_prefix.value}-rtb"
+  }
 }
 
-resource "aws_instance" "web" {
-  # The connection block tells our provisioner how to
-  # communicate with the resource (instance)
-  connection {
-    type = "ssh"
-    # The default username for our AMI
-    user = "ubuntu"
-    host = self.public_ip
-    # The connection will use the local SSH agent for authentication.
+resource "aws_route_table_association" "rtbassoc" {
+  subnet_id      = aws_subnet.web_subnet.id
+  route_table_id = aws_route_table.web_rtb.id
+}
+
+resource "aws_route_table_association" "rtbassoc2" {
+  subnet_id      = aws_subnet.web_subnet2.id
+  route_table_id = aws_route_table.web_rtb.id
+}
+
+resource "aws_route" "public_internet_gateway" {
+  route_table_id         = aws_route_table.web_rtb.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.web_igw.id
+
+  timeouts {
+    create = "5m"
   }
+}
 
-  instance_type = "t2.micro"
 
-  # Lookup the correct AMI based on the region
-  # we specified
-  ami = var.aws_amis[var.aws_region]
+resource "aws_network_interface" "web-eni" {
+  subnet_id   = aws_subnet.web_subnet.id
+  private_ips = ["172.16.10.100"]
 
-  # The name of our SSH keypair we created above.
-  key_name = aws_key_pair.auth.id
-
-  # Our Security group to allow HTTP and SSH access
-  vpc_security_group_ids = [aws_security_group.default.id]
-
-  # We're going to launch into the same subnet as our ELB. In a production
-  # environment it's more common to have a separate private subnet for
-  # backend instances.
-  subnet_id = aws_subnet.default.id
-
-  # We run a remote provisioner on the instance after creating it.
-  # In this case, we just install nginx and start it. By default,
-  # this should be on port 80
-  provisioner "remote-exec" {
-    inline = [
-      "sudo apt-get -y update",
-      "sudo apt-get -y install nginx",
-      "sudo service nginx start",
-    ]
+  tags = {
+    Name = "${local.resource_prefix.value}-primary_network_interface"
   }
+}
+
+# VPC Flow Logs to S3
+resource "aws_flow_log" "vpcflowlogs" {
+  log_destination      = aws_s3_bucket.flowbucket.arn
+  log_destination_type = "s3"
+  traffic_type         = "ALL"
+  vpc_id               = aws_vpc.web_vpc.id
+
+  tags = {
+    Name        = "${local.resource_prefix.value}-flowlogs"
+    Environment = local.resource_prefix.value
+  }
+}
+
+resource "aws_s3_bucket" "flowbucket" {
+  bucket        = "${local.resource_prefix.value}-flowlogs"
+  force_destroy = true
+
+  tags = {
+    Name        = "${local.resource_prefix.value}-flowlogs"
+    Environment = local.resource_prefix.value
+  }
+}
+
+output "ec2_public_dns" {
+  description = "Web Host Public DNS name"
+  value       = aws_instance.web_host.public_dns
+}
+
+output "vpc_id" {
+  description = "The ID of the VPC"
+  value       = aws_vpc.web_vpc.id
+}
+
+output "public_subnet" {
+  description = "The ID of the Public subnet"
+  value       = aws_subnet.web_subnet.id
+}
+
+output "public_subnet2" {
+  description = "The ID of the Public subnet"
+  value       = aws_subnet.web_subnet2.id
 }
